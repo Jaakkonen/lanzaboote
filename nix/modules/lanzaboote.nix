@@ -234,7 +234,17 @@ in
           --systemd-boot-loader-config ${loaderConfigFile} \
           --configuration-limit ${toString configurationLimit} \
           --allow-unsigned ${lib.boolToString cfg.allowUnsigned} \
-          --bootcounting-initial-tries ${toString cfg.bootCounting.initialTries}'';
+          --bootcounting-initial-tries ${toString cfg.bootCounting.initialTries}''
+      + lib.optionalString cfg.pcrSignature.enable (
+        " "
+        + lib.escapeShellArgs (
+          [
+            "--pcr-private-key=${toString cfg.pcrSignature.privateKeyFile}"
+            "--pcr-public-key=${toString cfg.pcrSignature.publicKeyFile}"
+          ]
+          ++ map (phase: "--pcr-phase=${phase}") cfg.pcrSignature.phases
+        )
+      );
       defaultText = lib.literalExpression ''
         ''${lib.getExe config.boot.lanzaboote.package} ''${lib.optionalString (config.boot.lanzaboote.logLevel == "debug") "-vv"} install \
           --system ''${config.boot.kernelPackages.stdenv.hostPlatform.system} \
@@ -301,6 +311,23 @@ in
           See <https://github.com/Foxboron/sbctl/wiki/FAQ#option-rom> for more
           details.
         '';
+      };
+    };
+
+    pcrSignature = {
+      enable = lib.mkEnableOption "sign PCR11 policies for retained boot generations";
+      privateKeyFile = lib.mkOption {
+        type = lib.types.path;
+        description = "Runtime path to the private PEM key used by systemd-measure.";
+      };
+      publicKeyFile = lib.mkOption {
+        type = lib.types.path;
+        description = "Public PEM key enrolled in systemd encrypted credentials.";
+      };
+      phases = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ "sysinit:ready" ];
+        description = "Systemd boot phase paths authorized by the signed policy.";
       };
     };
 

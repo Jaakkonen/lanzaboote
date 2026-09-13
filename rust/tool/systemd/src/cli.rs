@@ -68,6 +68,17 @@ struct InstallCommand {
     #[arg(long)]
     pcrlock_directory: Option<PathBuf>,
 
+    /// PCR policy signing key pair for systemd encrypted credentials
+    #[arg(long, requires = "pcr_public_key")]
+    pcr_private_key: Option<PathBuf>,
+
+    #[arg(long, requires = "pcr_private_key")]
+    pcr_public_key: Option<PathBuf>,
+
+    /// Boot phase paths authorized by the signed PCR policy
+    #[arg(long, default_value = "sysinit:ready")]
+    pcr_phase: Vec<String>,
+
     /// EFI system partition mountpoint (e.g. efiSysMountPoint)
     esp: PathBuf,
 
@@ -117,7 +128,14 @@ fn install(args: InstallCommand) -> Result<()> {
         args.pcrlock_directory,
         args.esp,
         args.generations,
-    );
+    )
+    .with_pcr_signature(args.pcr_private_key.zip(args.pcr_public_key).map(
+        |(private_key, public_key)| install::PcrSignature {
+            private_key,
+            public_key,
+            phases: args.pcr_phase,
+        },
+    ));
 
     if args.allow_unsigned
         && std::fs::exists(public_key).ok().is_none_or(|b| !b)
