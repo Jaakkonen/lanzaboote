@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::os::unix::prelude::{OsStrExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::string::ToString;
 
 use anyhow::{Context, Result, anyhow};
@@ -25,6 +26,12 @@ use lanzaboote_tool::pe::{self, append_initrd_secrets, lanzaboote_image};
 use lanzaboote_tool::signature::Signer;
 use lanzaboote_tool::utils::{SecureTempDirExt, file_hash};
 
+pub struct PcrSignature {
+    pub private_key: PathBuf,
+    pub public_key: PathBuf,
+    pub phases: Vec<String>,
+}
+
 pub struct InstallerBuilder {
     lanzaboote_stub: PathBuf,
     arch: Architecture,
@@ -34,6 +41,7 @@ pub struct InstallerBuilder {
     bootcounting_initial_tries: u32,
     pcrlock_directory: Option<PathBuf>,
     protected_system: Option<PathBuf>,
+    pcr_signature: Option<PcrSignature>,
     esp: PathBuf,
     generation_links: Vec<PathBuf>,
 }
@@ -61,9 +69,15 @@ impl InstallerBuilder {
             bootcounting_initial_tries,
             pcrlock_directory,
             protected_system,
+            pcr_signature: None,
             esp,
             generation_links,
         }
+    }
+
+    pub fn with_pcr_signature(mut self, signature: Option<PcrSignature>) -> Self {
+        self.pcr_signature = signature;
+        self
     }
 
     pub fn build<S: Signer>(self, signer: S) -> Installer<S> {
@@ -87,6 +101,7 @@ impl InstallerBuilder {
             bootcounting_initial_tries: self.bootcounting_initial_tries,
             pcrlock_paths,
             protected_system: self.protected_system,
+            pcr_signature: self.pcr_signature,
             esp_paths,
             generation_links: self.generation_links,
             arch: self.arch,
@@ -105,6 +120,7 @@ pub struct Installer<S: Signer> {
     bootcounting_initial_tries: u32,
     pcrlock_paths: Option<PcrlockPaths>,
     protected_system: Option<PathBuf>,
+    pcr_signature: Option<PcrSignature>,
     esp_paths: SystemdEspPaths,
     generation_links: Vec<PathBuf>,
     arch: Architecture,
@@ -256,6 +272,38 @@ impl<S: Signer> Installer<S> {
     fn install_generation(&mut self, generation: &Generation) -> Result<()> {
         log::debug!("Installing generation {}", generation.version_tag());
 
+        // Companion files belong to the same native generation lifecycle as the
+        // kernel and initrd. Publish them even when reusing an installed stub:
+        // this restores missing files and registers every retained file as a root.
+        for (name, source) in &generation.spec.lanzaboote_extension.boot_files {
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name != "."
+                    && name != ".."
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c)),
+                "Companion file name must be a single safe filename: {name}"
+            );
+            let target = self.esp_paths.nixos.join(name);
+            // Names must be immutable: never damage an older generation if a
+            // caller accidentally reuses a name for different contents.
+            if target.exists() {
+                anyhow::ensure!(
+                    file_hash(source)? == file_hash(&target)?,
+                    "Companion file name reused with different contents: {name}"
+                );
+            } else {
+                install(source, &target).context("Failed to publish companion boot file")?;
+            }
+            self.gc_roots.extend([&target]);
+        }
+        // Make companions durable before publishing any entry that references them.
+        if !generation.spec.lanzaboote_extension.boot_files.is_empty() {
+            syncfs(File::open(&self.esp_paths.esp)?)
+                .context("Failed to sync companion boot files")?;
+        }
+
         // If the generation is already properly installed, don't overwrite it.
         if self.register_installed_generation(generation)? {
             return Ok(());
@@ -317,8 +365,18 @@ impl<S: Signer> Installer<S> {
 
         let os_release_contents = os_release.to_string();
 
-        let kernel_cmdline =
+        let mut kernel_cmdline =
             assemble_kernel_cmdline(&bootspec.init, bootspec.kernel_params.clone());
+        let pcr_signature_path = self.pcr_signature_path(generation)?;
+        if let Some(path) = &pcr_signature_path {
+            kernel_cmdline.push(format!(
+                "lanzaboote.pcr_signature=/EFI/nixos/{}",
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .context("Invalid PCR signature filename")?
+            ));
+        }
 
         let parameters = pe::StubParameters::new(
             &self.lanzaboote_stub,
@@ -333,6 +391,43 @@ impl<S: Signer> Installer<S> {
 
         let lanzaboote_image_path = lanzaboote_image(&tempdir, &parameters)
             .context("Failed to build and sign lanzaboote stub image.")?;
+
+        if let (Some(signature), Some(target)) = (&self.pcr_signature, &pcr_signature_path) {
+            // Read the exact PE sections, including their actual byte lengths.
+            let image = fs::read(&lanzaboote_image_path)?;
+            let osrel = tempdir.write_secure_file(
+                pe::read_section_data(&image, ".osrel").context("Missing .osrel")?,
+            )?;
+            let cmdline = tempdir.write_secure_file(
+                pe::read_section_data(&image, ".cmdline").context("Missing .cmdline")?,
+            )?;
+            let mut command = Command::new(self.systemd.join("lib/systemd/systemd-measure"));
+            command
+                .arg("sign")
+                .arg(format!("--linux={}", bootspec.kernel.display()))
+                .arg(format!("--initrd={}", initrd_location.display()))
+                .arg(format!("--osrel={}", osrel.display()))
+                .arg(format!("--cmdline={}", cmdline.display()))
+                .arg("--bank=sha256")
+                .arg(format!("--private-key={}", signature.private_key.display()))
+                .arg(format!("--public-key={}", signature.public_key.display()));
+            for phase in &signature.phases {
+                command.arg(format!("--phase={phase}"));
+            }
+            let output = command
+                .output()
+                .context("Failed to run systemd-measure sign")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "systemd-measure sign failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let policy = tempdir.write_secure_file(&output.stdout)?;
+            install(&policy, target).context("Failed to publish PCR signature")?;
+            self.gc_roots.extend([target]);
+            // Publish the policy before the referencing signed boot entry.
+            syncfs(File::open(&self.esp_paths.esp)?)?;
+        }
 
         if let Some(pcrlock_paths) = &self.pcrlock_paths {
             let lanzaboote_image_pcrlock =
@@ -351,6 +446,23 @@ impl<S: Signer> Installer<S> {
             .context("Failed to install the Lanzaboote stub.")?;
 
         Ok(())
+    }
+
+    fn pcr_signature_path(&self, generation: &Generation) -> Result<Option<PathBuf>> {
+        let Some(signature) = &self.pcr_signature else {
+            return Ok(None);
+        };
+        let mut hash = Sha256::new();
+        hash.update(fs::read(&signature.public_key)?);
+        for phase in &signature.phases {
+            hash.update([0]);
+            hash.update(phase.as_bytes());
+        }
+        Ok(Some(self.esp_paths.nixos.join(format!(
+            "{}-{}.pcrsig",
+            stub_prefix(generation, &self.signer)?,
+            Base32Unpadded::encode_string(&hash.finalize())
+        ))))
     }
 
     /// Register the files of an already installed generation as garbage collection roots.
@@ -374,6 +486,39 @@ impl<S: Signer> Installer<S> {
         // An Err returned from this function means that we couldn't properly read
         // the different files belonging to this generation, so it should be reinstalled
         if let Ok((stub_target, kernel_path, initrd_path)) = self.read_installed_generation(regex) {
+            let stub = fs::read(&stub_target)?;
+            let cmdline = std::str::from_utf8(
+                pe::read_section_data(&stub, ".cmdline").context("Missing .cmdline")?,
+            )?;
+            let installed_policy = cmdline
+                .split_ascii_whitespace()
+                .rev()
+                .find_map(|arg| arg.strip_prefix("lanzaboote.pcr_signature="))
+                .map(|path| -> Result<PathBuf> {
+                    let name = path
+                        .strip_prefix("/EFI/nixos/")
+                        .context("PCR signature is outside EFI/nixos")?;
+                    anyhow::ensure!(
+                        name.ends_with(".pcrsig")
+                            && name
+                                .bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c)),
+                        "Invalid PCR signature filename"
+                    );
+                    Ok(self.esp_paths.nixos.join(name))
+                })
+                .transpose()?;
+            if let Some(expected) = self.pcr_signature_path(generation)? {
+                if installed_policy.as_ref() != Some(&expected) {
+                    return Ok(false);
+                }
+            }
+            if let Some(policy) = installed_policy {
+                if !policy.is_file() {
+                    return Ok(false);
+                }
+                self.gc_roots.extend([&policy]);
+            }
             self.gc_roots
                 .extend([&stub_target, &kernel_path, &initrd_path]);
             // Do not return yet, we still need to check the existence of the pcrlock measurements.
@@ -615,6 +760,18 @@ fn install_signed(signer: &impl Signer, from: &Path, to: &Path) -> Result<()> {
     signer
         .sign_and_copy(from, &to_tmp)
         .with_context(|| format!("Failed to copy and sign file from {from:?} to {to:?}"))?;
+    // A signer may report success even when its output could not be written
+    // (for example, sbsign on a full ESP). Never publish an invalid image.
+    if !signer
+        .verify_path(&to_tmp)
+        .with_context(|| format!("Failed to verify signed temporary file {to_tmp:?}"))?
+    {
+        return Err(anyhow!("Invalid signature on temporary file {to_tmp:?}"));
+    }
+    File::open(&to_tmp)
+        .with_context(|| format!("Failed to open signed temporary file {to_tmp:?}"))?
+        .sync_all()
+        .with_context(|| format!("Failed to sync signed temporary file {to_tmp:?}"))?;
     fs::rename(&to_tmp, to).with_context(|| {
         format!("Failed to move temporary file {to_tmp:?} to final location {to:?}")
     })?;
@@ -727,4 +884,49 @@ fn newer_systemd_boot(from: &Path, to: &Path) -> Result<bool> {
     };
 
     Ok(from_version > to_version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lanzaboote_tool::signature::LocalKeyPair;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn failed_signed_write_does_not_publish_or_replace_image() -> Result<()> {
+        let systemd = PathBuf::from(std::env::var("TEST_SYSTEMD")?);
+        let architecture =
+            Architecture::from_nixos_system(&format!("{}-linux", std::env::consts::ARCH))?;
+        let source = systemd
+            .join("lib/systemd/boot/efi")
+            .join(architecture.systemd_filename());
+        let signer = LocalKeyPair::new(
+            Path::new("tests/fixtures/uefi-keys/db.pem"),
+            Path::new("tests/fixtures/uefi-keys/db.key"),
+        );
+
+        for existing in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let destination = directory.path().join("boot.efi");
+            let previous = if existing {
+                install_signed(&signer, &source, &destination)?;
+                assert!(signer.verify_path(&destination)?);
+                Some(fs::read(&destination)?)
+            } else {
+                None
+            };
+
+            // sbsign 0.9.5 exits successfully even when writing to /dev/full.
+            // This reproduces ENOSPC without a privileged filesystem mount.
+            symlink("/dev/full", destination.with_extension(".tmp"))?;
+            assert!(install_signed(&signer, &source, &destination).is_err());
+            if let Some(previous) = previous {
+                assert_eq!(fs::read(&destination)?, previous);
+                assert!(signer.verify_path(&destination)?);
+            } else {
+                assert!(!destination.exists());
+            }
+        }
+        Ok(())
+    }
 }

@@ -23,33 +23,29 @@ pub struct ExtendedBootJson {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct LanzabooteExtension {
     pub sort_key: String,
+    /// Immutable companion files published in EFI/nixos before the boot entry.
+    #[serde(default)]
+    pub boot_files: HashMap<String, PathBuf>,
 }
 
 impl Default for LanzabooteExtension {
     fn default() -> Self {
         Self {
             sort_key: String::from("lanzaboote"),
+            boot_files: HashMap::new(),
         }
     }
 }
 
-impl From<bootspec::Specialisation> for LanzabooteExtension {
-    fn from(spec: bootspec::Specialisation) -> Self {
-        spec.extensions
-            .get("org.nix-community.lanzaboote")
-            .and_then(|v| serde_json::from_value::<LanzabooteExtension>(v.clone()).ok())
-            .unwrap_or_default()
-    }
-}
-
-impl From<bootspec::BootJson> for LanzabooteExtension {
-    fn from(spec: bootspec::BootJson) -> Self {
-        spec.extensions
-            .get("org.nix-community.lanzaboote")
-            .and_then(|v| serde_json::from_value::<LanzabooteExtension>(v.clone()).ok())
-            .unwrap_or_default()
+fn lanzaboote_extension(value: Option<&serde_json::Value>) -> Result<LanzabooteExtension> {
+    match value {
+        Some(value) => {
+            serde_json::from_value(value.clone()).context("Malformed Lanzaboote bootspec extension")
+        }
+        None => Ok(LanzabooteExtension::default()),
     }
 }
 
@@ -98,7 +94,11 @@ impl Generation {
             specialisation_name: Some(specialisation_name),
             spec: ExtendedBootJson {
                 bootspec: specialisation.clone().generation,
-                lanzaboote_extension: specialisation.clone().into(),
+                lanzaboote_extension: lanzaboote_extension(
+                    specialisation
+                        .extensions
+                        .get("org.nix-community.lanzaboote"),
+                )?,
             },
             specialisations: Self::parse_specialisations(
                 link,
@@ -133,7 +133,9 @@ impl Generation {
             specialisation_name,
             spec: ExtendedBootJson {
                 bootspec: bootspec.clone(),
-                lanzaboote_extension: boot_json.into(),
+                lanzaboote_extension: lanzaboote_extension(
+                    boot_json.extensions.get("org.nix-community.lanzaboote"),
+                )?,
             },
             specialisations: Self::parse_specialisations(link, bootspec.specialisations)?,
         })
@@ -240,6 +242,20 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeSet;
+
+    #[test]
+    fn unknown_extension_fields_preserve_defaults() {
+        let value = serde_json::json!({ "future_field": true });
+        let extension = lanzaboote_extension(Some(&value)).unwrap();
+        assert_eq!(extension.sort_key, "lanzaboote");
+        assert!(extension.boot_files.is_empty());
+    }
+
+    #[test]
+    fn malformed_companion_metadata_is_not_silently_discarded() {
+        let value = serde_json::json!({ "boot_files": ["invalid"] });
+        assert!(lanzaboote_extension(Some(&value)).is_err());
+    }
 
     #[test]
     fn parse_version_correctly() {
